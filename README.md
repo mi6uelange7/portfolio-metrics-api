@@ -71,6 +71,6 @@ LEARN.md        # detailed notes on every phase — what was built and why
 - [x] Phase 1 — Basic FastAPI endpoint
 - [x] Phase 2 — Service layer (separated business logic)
 - [x] Phase 3+4 — Structured logging + environment config
-- [ ] Phase 5 — Unit tests
-- [ ] Phase 6 — Dockerfile + containerization
-- [ ] Phase 7 — CI/CD pipeline
+- [x] Phase 5 — Unit tests
+- [x] Phase 6 — Dockerfile + containerization
+- [x] Phase 7 — CI/CD pipeline

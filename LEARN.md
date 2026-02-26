@@ -249,4 +249,188 @@ This is structured logging — formatting log output so it's machine-parseable a
 
 ---
 
-<!-- Phase 5 content will be appended here -->
+## Phase 5 — Unit Tests
+
+### What I built
+Two test files:
+- `tests/test_services.py` — unit tests for the service functions directly
+- `tests/test_main.py` — endpoint tests via FastAPI's `TestClient`
+
+9 tests total. All of them run without making a single real HTTP request.
+
+### Why tests matter
+Here's the thing about untested code — it works until it doesn't, and when it breaks in production, you're debugging live with real consequences. Tests make the failure happen early, locally, when you can still do something about it.
+
+More specifically in a CI/CD context: every push triggers the test stage. If something's broken, the pipeline fails before the code ever gets near a container or a deployment. That's the whole point — catch it early, in isolation, before it becomes someone else's problem.
+
+### What actually gets tested
+
+**`calculate_portfolio` — pure function, no mocking needed**
+```python
+def test_valid_amounts(self):
+    result = calculate_portfolio(0.5, 2.0, prices)
+    assert result["total_value_usd"] == 31000.0
+```
+No HTTP, no I/O, no mocking. Feed it inputs, check the output. This is what pure functions buy you — tests that are trivial to write and impossible to flake.
+
+**`fetch_prices` — mocked HTTP calls**
+```python
+with patch("app.services.httpx.get") as mock_get:
+    mock_get.side_effect = httpx.RequestError("timeout")
+    with pytest.raises(HTTPException) as exc:
+        fetch_prices()
+    assert exc.value.status_code == 503
+```
+Can't call the real CoinGecko API in tests — it's flaky, rate-limited, and slow. `unittest.mock.patch` swaps out `httpx.get` for a fake that behaves however I tell it to. This lets me test the error handling paths that would be nearly impossible to trigger against a real API.
+
+**Endpoint tests — `TestClient`**
+```python
+with patch("app.main.fetch_prices", return_value=MOCK_PRICES):
+    response = client.get("/portfolio?btc=0.5&eth=2.0")
+assert response.status_code == 200
+```
+FastAPI's `TestClient` wraps the app and lets you send requests without running a server. Combined with mocking `fetch_prices`, I can test the full request/response cycle in pure Python.
+
+### What each test covers
+| Test | What it proves |
+|------|---------------|
+| `test_valid_amounts` | Core math is correct |
+| `test_zero_amounts` | Edge case — zero holdings doesn't break anything |
+| `test_rounding` | Floating point gets rounded to 2 decimal places |
+| `test_http_status_error_raises_502` | Bad API response → correct status code |
+| `test_request_error_raises_503` | Network failure → correct status code |
+| `test_returns_price_data` | Happy path returns the expected data |
+| `test_portfolio_valid_request` | Full endpoint returns correct shape |
+| `test_portfolio_zero_values` | Zero amounts work end-to-end |
+| `test_portfolio_missing_params` | Missing query params → 422 (FastAPI validation) |
+
+### How tests prevent production failures
+The test for missing params is a good example. I didn't write any validation code — FastAPI handles it. But by writing `test_portfolio_missing_params`, I'm asserting that this behavior exists and will keep existing. If someone later strips out the `Query(...)` annotation, that test fails and the pipeline blocks the merge. The contract is enforced automatically.
+
+### Key concepts from this phase
+- **pytest** — Python test framework, finds and runs test functions automatically
+- **`unittest.mock.patch`** — replaces a real function with a fake for the duration of a test
+- **`TestClient`** — sends HTTP requests to the app without a running server
+- **Pure function testing** — no setup, no teardown, no mocking needed
+- **Mocking** — isolate the unit under test by controlling its dependencies
+
+### Interview talking points
+- "I separated unit tests from integration-style tests — service logic gets tested directly, the endpoint gets tested via TestClient"
+- "The HTTP calls are mocked — tests don't touch the real CoinGecko API, so they're fast, reliable, and runnable offline"
+- "The `calculate_portfolio` function being pure made it trivial to test — that's a direct payoff from the Phase 2 separation"
+- "The 422 test isn't testing my code — it's testing that FastAPI's validation is wired up correctly, which is still worth having"
+
+---
+
+## Phase 6 + 7 — Docker and CI/CD
+
+### What I built
+- `Dockerfile` — packages the app into a container image
+- `.gitlab-ci.yml` — two-stage pipeline: test then build
+
+These two belong together. The whole point of the CI pipeline is to test the code and then build a verified image. One without the other is incomplete.
+
+### What Docker actually is
+Docker packages an application and everything it needs to run — the runtime, dependencies, config — into a single portable unit called a container image.
+
+Before containers, deploying Python meant: install Python, install the right version of Python, set up a virtualenv, install dependencies, configure environment variables, hope the server's OS doesn't interfere. Now it means: `docker run`.
+
+The image is built once and runs identically everywhere — on your laptop, on a CI runner, in production. That's the value. Not "it works on my machine" — it works in the image, and the image runs anywhere.
+
+### Reading the Dockerfile
+```dockerfile
+FROM python:3.11-slim          # base image — Python 3.11 on minimal Debian
+WORKDIR /app                   # all commands run from here inside the container
+COPY requirements.txt .        # copy this first — layer caching
+RUN pip install --no-cache-dir -r requirements.txt  # install deps
+COPY app/ ./app/               # copy app code after deps (cache optimization)
+EXPOSE 8000                    # documents the port — doesn't actually open it
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+```
+
+The ordering of `COPY requirements.txt` before `COPY app/` is intentional. Docker builds images in layers and caches each one. Dependencies change rarely. App code changes constantly. By copying `requirements.txt` first and installing before copying the code, Docker can skip the `pip install` step on rebuilds as long as the requirements haven't changed. This makes builds significantly faster.
+
+### Container isolation
+The container runs in its own filesystem, network namespace, and process space. It can only see what you explicitly give it. This matters for security — a compromised container can't easily reach the host or other containers. It also means the app behaves the same regardless of what else is running on the host.
+
+### The CI/CD pipeline
+
+```yaml
+stages:
+  - test
+  - docker-build
+```
+
+Two stages, run in order. If `test` fails, `docker-build` never runs. You never ship a broken image.
+
+**test stage:**
+```yaml
+test:
+  image: python:3.11-slim
+  before_script:
+    - pip install -r requirements.txt
+  script:
+    - pytest tests/ -v
+```
+Spins up a fresh Python container on every push, installs dependencies, runs the test suite. If any test fails, the stage fails and GitLab marks the pipeline red. The `docker-build` stage doesn't execute.
+
+**docker-build stage:**
+```yaml
+docker-build:
+  image: docker:24
+  services:
+    - docker:24-dind        # Docker-in-Docker — lets CI build Docker images
+  script:
+    - docker build -t $CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA .
+    - docker push $CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA
+  only:
+    - main                  # only build images from main branch
+```
+`$CI_REGISTRY_IMAGE` and `$CI_COMMIT_SHORT_SHA` are GitLab's built-in variables. Every merge to main gets its own tagged image. If something goes wrong, you can pull any previous image by its commit SHA and roll back.
+
+### What happens on a push
+```
+git push
+      |
+GitLab detects the push
+      |
+Pipeline triggers
+      |
+Stage 1: test
+  → fresh container spins up
+  → pip install
+  → pytest runs
+  → if any test fails → pipeline fails, nothing ships
+      |
+Stage 2: docker-build (only if test passed)
+  → docker build
+  → image tagged with commit SHA
+  → pushed to GitLab container registry
+      |
+Image is ready to deploy
+```
+
+### Why CI reduces operational risk
+Without CI, the flow is: write code → push → manually test → manually build → deploy → find out it was broken. Every one of those manual steps is a place where things get skipped when you're in a hurry.
+
+With CI, the flow is: push → pipeline either passes or fails. No manual steps. No "I'll test it after". The tests run on every push whether you remember to or not. The image only gets built if the tests pass. It's not about distrust — it's about not relying on memory and discipline to catch things that a machine can catch automatically.
+
+### Key concepts from this phase
+- **Docker** — packages app + runtime into a portable container image
+- **Dockerfile** — instructions for building the image
+- **Layer caching** — ordering COPY/RUN to maximize cache hits on rebuilds
+- **Container isolation** — own filesystem, network, process space
+- **CI/CD** — automated pipeline triggered on push
+- **Pipeline stages** — ordered, each stage gates the next
+- **Docker-in-Docker (dind)** — lets CI runners build Docker images
+- **Image tagging by commit SHA** — enables precise rollbacks
+
+### Interview talking points
+- "The Dockerfile copies requirements before code — intentional for layer caching, keeps rebuilds fast when only app code changes"
+- "The CI pipeline has two stages — test gates the build. A failing test means no image gets produced, so broken code can't ship"
+- "Images are tagged with the commit SHA, not `latest` — that means every deployment is traceable back to an exact commit and rollbacks are a single command"
+- "Docker-in-Docker lets the CI runner build and push container images without needing Docker pre-installed on the host"
+
+---
+
+<!-- Phase 8 content will be appended here -->
